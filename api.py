@@ -20,7 +20,6 @@ def main() -> None:
     target = random.choice(paintings)
     object_id = target['Object ID']
 
-    # Разбиваем длинную строку, чтобы влезть в лимит 90 символов
     api_base = "https://collectionapi.metmuseum.org/public/collection/v1/objects/"
     api_url = f"{api_base}{object_id}"
 
