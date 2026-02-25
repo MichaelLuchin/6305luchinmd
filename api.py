@@ -25,7 +25,7 @@ def main() -> None:
 
     response = requests.get(api_url, timeout=10).json()
 
-    img_url = response.get('primaryImage')
+    img_url = response.get('primaryImageSmall')
     if not img_url:
         print("Изображение не найдено, запустите скрипт снова.")
         return
