@@ -143,7 +143,7 @@ def process_lab_equalization(img_bgr: np.ndarray) -> np.ndarray:
 
     l_equalized = manual_histogram_equalization(l_channel)
 
-    lab_res = cv2.merge((l_equalized, a_channel, b_channel))
+    lab_res = np.stack([l_equalized, a_channel, b_channel], axis = 2)
     return cv2.cvtColor(lab_res, cv2.COLOR_LAB2BGR)
 
 
