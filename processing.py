@@ -44,13 +44,18 @@ def manual_grayscale(img_rgb: np.ndarray) -> np.ndarray:
     return np.dot(img_rgb[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
 
 
-def manual_conv(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+def manual_conv(
+    image: np.ndarray,
+    kernel: np.ndarray,
+    clip_output: bool = True,
+) -> np.ndarray:
     """
     Свёртка с использованием двумерной маски.
 
     Args:
         image: Исходное полутоновое изображение.
         kernel: Ядро свёртки (маска).
+        clip_output: Флаг обрезки от 0 до 255.
 
     Returns:
         Изображение после применения свёртки.
@@ -64,10 +69,13 @@ def manual_conv(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
     for row in range(i_h):
         for col in range(i_w):
-            region = padded[row:row+k_h, col:col+k_w]
-            output[row, col] = np.clip(np.sum(region * kernel), 0, 255)
+            region = padded[row:row + k_h, col:col + k_w]
+            output[row, col] = np.sum(region * kernel)
 
-    return output.astype(np.uint8)
+    if clip_output:
+        return np.clip(output, 0, 255).astype(np.uint8)
+
+    return output
 
 
 def manual_gamma_correction(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
@@ -83,6 +91,22 @@ def manual_gamma_correction(image: np.ndarray, gamma: float = 1.0) -> np.ndarray
     """
     inv_gamma = 1.0 / gamma
     corrected = np.power(image / 255.0, inv_gamma) * 255.0
+    return np.clip(corrected, 0, 255).astype(np.uint8)
+
+
+def cv2_gamma_correction(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+    """
+    Гамма-коррекция изображения при помощи cv2.
+
+    Args:
+        image: Исходное изображение.
+        gamma: Коэффициент гаммы.
+
+    Returns:
+        Скорректированное изображение.
+    """
+    inv_gamma = 1.0 / gamma
+    corrected = cv2.pow(image / 255.0, inv_gamma) * 255.0
     return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
@@ -123,6 +147,78 @@ def process_lab_equalization(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(lab_res, cv2.COLOR_LAB2BGR)
 
 
+def sobel_manual(image: np.ndarray) -> np.ndarray:
+    """
+    Оператор Собеля для цветного изображения.
+
+    Args:
+        image: Исходное изображение (BGR или RGB).
+
+    Returns:
+        Магнитуда градиента для каждого канала.
+    """
+    image = image.astype(np.float32)
+
+    chan_b = sobel_chanel(image[:, :, 0])
+    chan_g = sobel_chanel(image[:, :, 1])
+    chan_r = sobel_chanel(image[:, :, 2])
+
+    return np.stack([chan_b, chan_g, chan_r], axis=2).astype(np.uint8)
+
+
+def sobel_chanel(channel: np.ndarray) -> np.ndarray:
+    """
+    Оператор Собеля для одного канала.
+
+    Args:
+        channel: Одиночный цветовой канал.
+
+    Returns:
+        Магнитуда градиента (uint8).
+    """
+    gx = np.array([[-1, 0, 1],
+                   [-2, 0, 2],
+                   [-1, 0, 1]], dtype=np.float32)
+    gy = np.array([[-1, -2, -1],
+                   [0, 0, 0],
+                   [1, 2, 1]], dtype=np.float32)
+
+    grad_x = manual_conv(channel, gx, clip_output=False).astype(np.float32)
+    grad_y = manual_conv(channel, gy, clip_output=False).astype(np.float32)
+
+    magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    if magnitude.max() > 0:
+        magnitude = magnitude / magnitude.max() * 255
+
+    return magnitude.astype(np.uint8)
+
+
+def sobel_cv2(image: np.ndarray) -> np.ndarray:
+    """
+    Реализация оператора Собеля через OpenCV.
+
+    Args:
+        image: Исходное цветное изображение (BGR).
+
+    Returns:
+        Магнитуда градиента.
+    """
+    img_float = image.astype(np.float32)
+
+    grad_x = cv2.Sobel(img_float, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(img_float, cv2.CV_32F, 0, 1, ksize=3)
+
+    magnitude = cv2.magnitude(grad_x, grad_y)
+
+    for i in range(3):
+        max_val = magnitude[:, :, i].max()
+        if max_val > 0:
+            magnitude[:, :, i] = (magnitude[:, :, i] / max_val) * 255
+
+    return magnitude.astype(np.uint8)
+
+
 def main() -> None:
     """
     Основная функция обработки изображений.
@@ -147,19 +243,20 @@ def main() -> None:
     print(f"OpenCV Gray: {time.time() - t0:.4f}s")
 
     # --- 2. GAUSSIAN BLUR ---
+    t0 = time.time()
     g_kernel = gaussian_kernel(21, 5.0)
     blur_manual = manual_conv(gray_manual, g_kernel)
+    print(f"Manual Blur: {time.time() - t0:.4f}s")
 
     t0 = time.time()
     blur_cv = cv2.GaussianBlur(gray_cv, (21, 21), 5.0)
     print(f"OpenCV Blur: {time.time() - t0:.4f}s")
 
     # --- 3. SOBEL ---
-    sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-    edges_manual = manual_conv(gray_manual, sobel_x)
+    edges_manual = sobel_manual(img_bgr)
 
     t0 = time.time()
-    edges_cv = cv2.filter2D(gray_cv, -1, sobel_x)
+    edges_cv = sobel_cv2(img_bgr)
     print(f"OpenCV Sobel: {time.time() - t0:.4f}s")
 
     # --- 4. GAMMA CORRECTION ---
@@ -168,10 +265,7 @@ def main() -> None:
     print(f"Manual Gamma: {time.time() - t0:.4f}s")
 
     t0 = time.time()
-    # Библиотечный метод через таблицу поиска (LUT)
-    table_data = [((i / 255.0) ** (1.0 / 2.2)) * 255 for i in range(256)]
-    lut_table = np.array(table_data).astype("uint8")
-    gamma_cv = cv2.LUT(img_bgr, lut_table)
+    gamma_cv = cv2_gamma_correction(img_bgr, 2.2)
     print(f"OpenCV Gamma: {time.time() - t0:.4f}s")
 
     # --- 5. HISTOGRAM EQUALIZATION ---
