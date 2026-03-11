@@ -87,12 +87,18 @@ class Artwork(ABC):
         img1 = self._image
         img2 = other.image
 
-        # Приведение к одному размеру, если они разные
-        if img1.shape[:2] != img2.shape[:2]:
-            img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+        h1, w1 = img1.shape[:2]
+        h2, w2 = img2.shape[:2]
 
-        # Смешивание
-        blended = cv2.addWeighted(img1, 0.5, img2, 0.5, 0)
+        if (h1, w1) != (h2, w2):
+            row_indices = (np.arange(h1) * (h2 / h1)).astype(np.intp)
+            col_indices = (np.arange(w1) * (w2 / w1)).astype(np.intp)
+
+            img2 = img2[row_indices[:, np.newaxis], col_indices]
+
+        blended = (img1.astype(np.float32) * 0.5 + img2.astype(np.float32) * 0.5)
+
+        blended = blended.astype(np.uint8)
         return self.__class__(blended, self._metadata)
 
     @staticmethod
@@ -122,7 +128,6 @@ class Artwork(ABC):
             Обработанный массив изображения.
         """
         inv_gamma = 1.0 / gamma
-        # Нормировка -> Степень -> Возврат к 0-255
         corrected = np.power(self._image / 255.0, inv_gamma) * 255.0
         return np.clip(corrected, 0, 255).astype(np.uint8)
 
