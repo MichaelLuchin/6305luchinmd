@@ -131,14 +131,14 @@ class Artwork(ABC):
         corrected = np.power(self._image / 255.0, inv_gamma) * 255.0
         return np.clip(corrected, 0, 255).astype(np.uint8)
 
+    @abstractmethod
     def extract_edges(self: 'Artwork') -> np.ndarray:
         """Выделение границ оператором Собеля.
 
         Returns:
             Изображение с выделенными границами.
         """
-        sobel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        return self.apply_convolution(sobel_x)
+        pass
 
     def smooth(self: 'Artwork', size: int = 15, sigma: float = 3.0) -> np.ndarray:
         """Сглаживание фильтром Гаусса.
@@ -155,11 +155,12 @@ class Artwork(ABC):
         return self.apply_convolution(kernel)
 
     @abstractmethod
-    def apply_convolution(self: 'Artwork', kernel: np.ndarray) -> np.ndarray:
+    def apply_convolution(self: 'Artwork', kernel: np.ndarray, clip_output: bool = True) -> np.ndarray:
         """Абстрактный метод свертки.
 
         Args:
             kernel: Ядро свертки.
+            clip_output: Флаг обрезки от 0 до 255.
         """
         pass
 
@@ -191,11 +192,12 @@ class BlackAndWhiteArtwork(Artwork):
 
         super().__init__(image, metadata)
 
-    def apply_convolution(self: 'BlackAndWhiteArtwork', kernel: np.ndarray) -> np.ndarray:
+    def apply_convolution(self: 'BlackAndWhiteArtwork', kernel: np.ndarray, clip_output: bool = True) -> np.ndarray:
         """Ручная свертка для одного канала.
 
         Args:
             kernel: Ядро свертки.
+            clip_output: Флаг обрезки от 0 до 255.
 
         Returns:
             Результат свертки.
@@ -206,12 +208,15 @@ class BlackAndWhiteArtwork(Artwork):
         padded = np.pad(self._image, pad, mode='constant')
         output = np.zeros_like(self._image, dtype=np.float32)
 
-        for row_idx in range(img_h):
-            for col_idx in range(img_w):
-                region = padded[row_idx:row_idx + k_h, col_idx:col_idx + k_w]
-                output[row_idx, col_idx] = np.sum(region * kernel)
+        for row in range(img_h):
+            for col in range(img_w):
+                region = padded[row:row + k_h, col:col + k_w]
+                output[row, col] = np.sum(region * kernel)
 
-        return np.clip(output, 0, 255).astype(np.uint8)
+        if clip_output:
+            return np.clip(output, 0, 255).astype(np.uint8)
+
+        return output
 
     def equalize_histogram(self: 'BlackAndWhiteArtwork') -> np.ndarray:
         """Ручное выравнивание гистограммы ЧБ (алгоритм через CDF).
@@ -225,6 +230,29 @@ class BlackAndWhiteArtwork(Artwork):
         cdf_m = (cdf_m - cdf_m.min()) * 255 / (cdf_m.max() - cdf_m.min())
         cdf = np.ma.filled(cdf_m, 0).astype('uint8')
         return cdf[self._image]
+
+    def extract_edges(self: 'BlackAndWhiteArtwork') -> np.ndarray:
+        """Выделение границ оператором Собеля ЧБ.
+
+        Returns:
+            Изображение с выделенными границами.
+        """
+        gx = np.array([[-1, 0, 1],
+                       [-2, 0, 2],
+                       [-1, 0, 1]], dtype=np.float32)
+        gy = np.array([[-1, -2, -1],
+                       [0, 0, 0],
+                       [1, 2, 1]], dtype=np.float32)
+
+        grad_x = self.apply_convolution(gx, clip_output=False).astype(np.float32)
+        grad_y = self.apply_convolution(gy, clip_output=False).astype(np.float32)
+
+        magnitude = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+        if magnitude.max() > 0:
+            magnitude = magnitude / magnitude.max() * 255
+
+        return magnitude.astype(np.uint8)
 
 
 class ColorArtwork(Artwork):
@@ -246,11 +274,12 @@ class ColorArtwork(Artwork):
 
         super().__init__(image, metadata)
 
-    def apply_convolution(self: 'ColorArtwork', kernel: np.ndarray) -> np.ndarray:
+    def apply_convolution(self: 'ColorArtwork', kernel: np.ndarray, clip_output: bool = True) -> np.ndarray:
         """Поканальная ручная свертка для BGR.
 
         Args:
             kernel: Ядро свертки.
+            clip_output: Флаг обрезки от 0 до 255.
 
         Returns:
             Обработанное цветное изображение.
@@ -259,7 +288,7 @@ class ColorArtwork(Artwork):
         processed_channels = []
         for ch in channels:
             temp_bw = BlackAndWhiteArtwork(ch, self._metadata)
-            processed_channels.append(temp_bw.apply_convolution(kernel))
+            processed_channels.append(temp_bw.apply_convolution(kernel, clip_output=clip_output))
 
         return cv2.merge(processed_channels)
 
@@ -275,17 +304,32 @@ class ColorArtwork(Artwork):
         temp_l = BlackAndWhiteArtwork(l_chan, self._metadata)
         l_eq = temp_l.equalize_histogram()
 
-        return cv2.cvtColor(cv2.merge((l_eq, a_chan, b_chan)), cv2.COLOR_LAB2BGR)
+        lab_res = np.stack([l_eq, a_chan, b_chan], axis=2)
+        return cv2.cvtColor(lab_res, cv2.COLOR_LAB2BGR)
 
     def to_grayscale(self: 'ColorArtwork') -> BlackAndWhiteArtwork:
         """Ручной перевод в ЧБ (0.299R + 0.587G + 0.114B).
 
-
         Returns:
             Новый объект BlackAndWhiteArtwork.
         """
-
-        blue_ch, green_ch, red_ch = cv2.split(self._image)
-        # Коэффициенты для перевода в оттенки серого
-        gray = (0.299 * red_ch + 0.587 * green_ch + 0.114 * blue_ch).astype(np.uint8)
+        # Переводим BGR в RGB, чтобы формула работала точь-в-точь как в функциональном коде
+        img_rgb = self._image[..., ::-1]
+        gray = np.dot(img_rgb[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
         return BlackAndWhiteArtwork(gray, self._metadata)
+
+    def extract_edges(self: 'ColorArtwork') -> np.ndarray:
+        """Выделение границ оператором Собеля цветного изображения.
+
+        Returns:
+            Изображение с выделенными границами.
+        """
+        temp_b = BlackAndWhiteArtwork(self._image[:, :, 0], self._metadata)
+        temp_g = BlackAndWhiteArtwork(self._image[:, :, 1], self._metadata)
+        temp_r = BlackAndWhiteArtwork(self._image[:, :, 2], self._metadata)
+
+        chan_b = temp_b.extract_edges()
+        chan_g = temp_g.extract_edges()
+        chan_r = temp_r.extract_edges()
+
+        return np.stack([chan_b, chan_g, chan_r], axis=2).astype(np.uint8)

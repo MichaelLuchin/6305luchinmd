@@ -14,7 +14,7 @@ def main() -> None:
     """
     # Создаем экземпляр управляющего класса
     # Путь пройдет через дескриптор ValidatedPath для проверки
-    app = ImageProcessor(save_dir='lab2_results')
+    app = ImageProcessor(save_dir='paintings')
 
     print("--- Запуск процесса обработки ---")
 
