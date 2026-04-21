@@ -1,34 +1,75 @@
-"""Модуль менеджера обработки изображений."""
+"""Модуль менеджера асинхронной обработки изображений."""
 
+import asyncio
 import csv
 import json
 import os
 import random
+from concurrent.futures import ProcessPoolExecutor
+from typing import Any, AsyncGenerator
 
+import aiofiles
+import aiohttp
 import cv2
-
-from models import ArtworkMetadata, ColorArtwork
-
 import numpy as np
 
-import requests
+from models import ArtworkMetadata, ColorArtwork
+from utils import ValidatedPath, async_timer_decorator
 
-from utils import ValidatedPath, timer_decorator
 
-
-class ImageProcessor:
-    """Класс для управления процессом загрузки и обработки произведений искусства.
-
-    Инкапсулирует логику взаимодействия с API и файловой системой.
-
-    Attributes:
-        save_dir: Путь к директории для сохранения результатов.
+def process_artwork_task(index: int, artwork: ColorArtwork) -> tuple[int, int, dict[str, bytes], dict]:
     """
+    CPU-bound задача для выполнения в отдельном процессе пула.
 
-    # Использование дескриптора для валидации пути сохранения
+    Осуществляет все матричные преобразования и сразу кодирует результат
+    в байты (jpg), чтобы минимизировать нагрузку на главный асинхронный поток.
+    """
+    pid = os.getpid()
+    obj_id = artwork.metadata.object_id
+    print(f"[LOG] Convolution for image {index} (ID {obj_id}) started (PID {pid})")
+
+    results_arrays = {}
+    results_arrays['0_original.jpg'] = artwork.image
+
+    gamma_img = artwork.apply_gamma(2.2)
+    results_arrays['1_gamma_corrected.jpg'] = gamma_img
+
+    hist_img = artwork.equalize_histogram()
+    results_arrays['2_histogram_equalized.jpg'] = hist_img
+
+    bw_artwork = artwork.to_grayscale()
+    results_arrays['3_grayscale.jpg'] = bw_artwork.image
+
+    blurred = bw_artwork.smooth(size=15, sigma=3.0)
+    results_arrays['4_gaussian_blur.jpg'] = blurred
+
+    edges = bw_artwork.extract_edges()
+    results_arrays['5_sobel_edges.jpg'] = edges
+
+    hist_obj = ColorArtwork(hist_img, artwork.metadata)
+    blended = artwork + hist_obj
+    results_arrays['6_blended_result.jpg'] = blended.image
+
+    # Кодируем изображения в байты внутри воркера для ускорения I/O в основном потоке
+    results_bytes = {}
+    for filename, img_array in results_arrays.items():
+        success, encoded = cv2.imencode('.jpg', img_array)
+        if success:
+            results_bytes[filename] = encoded.tobytes()
+
+    print(f"[LOG] Convolution for image {index} (ID {obj_id}) finished (PID {pid})")
+    return index, obj_id, results_bytes, artwork.metadata.raw_data
+
+
+class AsyncImageProcessor:
+    """
+    Класс асинхронного генераторного пайплайна.
+
+    Реализует паттерн Producer-Processor-Consumer.
+    """
     save_dir = ValidatedPath()
 
-    def __init__(self: 'ImageProcessor', save_dir: str = 'paintings') -> None:
+    def __init__(self, save_dir: str = 'processed_artworks') -> None:
         """Инициализация процессора.
 
         Args:
@@ -38,15 +79,8 @@ class ImageProcessor:
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
 
-    @timer_decorator
-    def download_artwork(self: 'ImageProcessor') -> ColorArtwork | None:
-        """Выбирает случайный объект из CSV и загружает данные через API.
-
-        Returns:
-            Экземпляр ColorArtwork или None в случае ошибки.
-        """
-        print("[LOG] Поиск случайного произведения в MetObjects.csv...")
-
+    def _get_urls_to_download(self, count: int) -> list[tuple[int, int]]:
+        """Парсит CSV и фиксирует порядковые номера."""
         paintings = []
         try:
             with open('MetObjects.csv', mode='r', encoding='utf-8') as f:
@@ -56,88 +90,155 @@ class ImageProcessor:
                         paintings.append(row)
         except FileNotFoundError:
             print("[ERROR] Файл MetObjects.csv не найден!")
-            return None
+            return []
 
         if not paintings:
-            print("[ERROR] Список картин пуст.")
-            return None
+            return []
 
-        target = random.choice(paintings)
-        object_id = target['Object ID']
-        base_url = "https://collectionapi.metmuseum.org/public/collection/v1/objects/"
-        api_url = f"{base_url}{object_id}"
+        targets = random.sample(paintings, min(count, len(paintings)))
+        # Формируем порядковый номер и ID объекта (начинается с 1)
+        return [(i + 1, int(t['Object ID'])) for i, t in enumerate(targets)]
 
-        try:
-            response = requests.get(api_url, timeout=15).json()
-            img_url = response.get('primaryImageSmall')
+    async def _fetch_single(self, index: int, object_id: int, session: aiohttp.ClientSession, max_retries: int = 3) -> \
+    tuple[int, ColorArtwork] | None:
+        """Асинхронная загрузка одного изображения с повторными попытками при ошибках."""
+        print(f"[LOG] Downloading image {index} started (ID {object_id})")
+        base_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{object_id}"
 
-            if not img_url:
-                print(f"[WARN] У объекта {object_id} нет фото. Пробую еще раз...")
-                return self.download_artwork()
+        for attempt in range(max_retries):
+            try:
+                async with session.get(base_url, timeout=15) as resp:
+                    data = await resp.json()
 
-            # Создание объекта метаданных (Dataclass)
-            metadata = ArtworkMetadata(
-                object_id=int(response.get("objectID", 0)),
-                title=response.get("title", "Untitled"),
-                department=response.get("department", "Unknown"),
-                raw_data=response,
-            )
+                img_url = data.get('primaryImageSmall')
+                if not img_url:
+                    print(f"[WARN] У объекта {object_id} нет фото. Пропускаем.")
+                    return None
 
-            # Загрузка самого изображения
-            img_data = requests.get(img_url, timeout=15).content
-            img_array = np.frombuffer(img_data, np.uint8)
-            img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                metadata = ArtworkMetadata(
+                    object_id=object_id,
+                    title=data.get("title", "Untitled"),
+                    department=data.get("department", "Unknown"),
+                    raw_data=data,
+                )
 
-            print(f"[LOG] Загружено: {metadata.title}")
-            return ColorArtwork(img_bgr, metadata)
+                async with session.get(img_url, timeout=15) as img_resp:
+                    img_bytes = await img_resp.read()
 
-        except Exception as e:
-            print(f"[ERROR] Ошибка при загрузке: {e}")
-            return None
+                img_array = np.frombuffer(img_bytes, np.uint8)
+                img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
-    @timer_decorator
-    def process_and_save_all(self: 'ImageProcessor', artwork: ColorArtwork) -> None:
-        """Выполняет цикл обработки и сохраняет результаты на диск.
+                if img_bgr is None:
+                    print(f"[WARN] Не удалось декодировать изображение {object_id}")
+                    return None
 
-        Args:
-            artwork: Объект цветного изображения для обработки.
-        """
-        print(f"[LOG] Начинаю обработку объекта: {artwork.metadata.title}")
+                print(f"[LOG] Downloading image {index} finished (ID {object_id})")
+                return index, ColorArtwork(img_bgr, metadata)
 
-        # 1. Сохранение оригинальных метаданных в JSON
-        meta_path = os.path.join(self.save_dir, 'metadata.json')
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump(artwork.metadata.raw_data, f, indent=4, ensure_ascii=False)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Экспоненциальная задержка: 1, 2, 4 секунды
+                    print(
+                        f"[WARN] Ошибка загрузки {object_id} (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {wait_time} сек.")
+                    await asyncio.sleep(wait_time)
+                else:
+                    print(f"[ERROR] Ошибка загрузки {object_id} после {max_retries} попыток: {e}")
+                    return None
+            except Exception as e:
+                print(f"[ERROR] Неожиданная ошибка загрузки {object_id}: {e}")
+                return None
 
-        # 2. Сохранение оригинала (из свойства .image)
-        cv2.imwrite(os.path.join(self.save_dir, '0_original.jpg'), artwork.image)
+        return None
 
-        # 3. Гамма-коррекция (на цветном)
-        gamma_img = artwork.apply_gamma(2.2)
-        cv2.imwrite(os.path.join(self.save_dir, '1_gamma_corrected.jpg'), gamma_img)
+    async def _check_done(self, futures: set, block: bool = False) -> tuple[set, set]:
+        """Вспомогательный метод для ожидания завершения futures."""
+        if not futures:
+            return set(), set()
 
-        # 4. Выравнивание гистограммы (цветное через LAB)
-        hist_img = artwork.equalize_histogram()
-        cv2.imwrite(os.path.join(self.save_dir, '2_histogram_equalized.jpg'), hist_img)
+        if block:
+            # Ждём завершения хотя бы одной задачи
+            done, pending = await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
+        else:
+            # Неблокирующая проверка: даём шанс завершившимся задачам
+            done, pending = await asyncio.wait(futures, timeout=0)
+            # Если ничего не готово, даём управление циклу событий
+            if not done:
+                await asyncio.sleep(0)
 
-        # 5. Преобразование в ЧБ (создание нового типа объекта)
-        bw_artwork = artwork.to_grayscale()
-        cv2.imwrite(os.path.join(self.save_dir, '3_grayscale.jpg'), bw_artwork.image)
+        return done, pending
 
-        # 6. Сглаживание Гауссом (на ЧБ объекте)
-        blurred = bw_artwork.smooth(size=15, sigma=3.0)
-        cv2.imwrite(os.path.join(self.save_dir, '4_gaussian_blur.jpg'), blurred)
+    async def download_generator(
+        self, object_ids: list[tuple[int, int]], session: aiohttp.ClientSession
+    ) -> AsyncGenerator[tuple[int, ColorArtwork], None]:
+        """Генератор №1: Асинхронно скачивает файлы и отдает их по мере готовности."""
+        pending = {asyncio.create_task(self._fetch_single(idx, obj_id, session)) for idx, obj_id in object_ids}
 
-        # 7. Выделение границ Собелем (на ЧБ объекте)
-        edges = bw_artwork.extract_edges()
-        cv2.imwrite(os.path.join(self.save_dir, '5_sobel_edges.jpg'), edges)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                result = task.result()
+                if result is not None:
+                    yield result
 
-        # 8. Демонстрация перегрузки оператора +
-        hist_obj = ColorArtwork(hist_img, artwork.metadata)
-        blended_artwork = artwork + hist_obj
-        cv2.imwrite(
-            os.path.join(self.save_dir, '6_blended_result.jpg'),
-            blended_artwork.image,
-        )
+    async def process_generator(
+            self, download_stream: AsyncGenerator[tuple[int, ColorArtwork], None], executor: ProcessPoolExecutor
+    ) -> AsyncGenerator[tuple[int, int, dict[str, bytes], dict], None]:
+        """Генератор №2: Принимает скачанные объекты и параллельно распределяет их по ядрам."""
+        loop = asyncio.get_running_loop()
+        pending_futures = set()
 
-        print(f"[LOG] Все файлы сохранены в директорию: {self.save_dir}")
+        async for index, artwork in download_stream:
+            # ИСПРАВЛЕНИЕ: Мы не используем asyncio.create_task!
+            # run_in_executor уже возвращает объект Future, который мы можем ждать.
+            future = loop.run_in_executor(executor, process_artwork_task, index, artwork)
+            pending_futures.add(future)
+
+            # Отдаем готовые результаты, если они есть, не блокируя цикл
+            done, pending_futures = await self._check_done(pending_futures, block=False)
+            for f in done:
+                yield f.result()
+
+        # Дожидаемся завершения задач в пуле процессов
+        while pending_futures:
+            done, pending_futures = await self._check_done(pending_futures, block=True)
+            for f in done:
+                yield f.result()
+
+    async def save_consumer(self, process_stream: AsyncGenerator[tuple[int, int, dict[str, bytes], dict], None]) -> None:
+        """Потребитель №3: Асинхронно сохраняет результаты на диск."""
+        async for index, obj_id, results_bytes, raw_metadata in process_stream:
+            print(f"[LOG] Saving for image {index} started")
+
+            meta_path = os.path.join(self.save_dir, f"{index}_{obj_id}_metadata.json")
+            async with aiofiles.open(meta_path, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(raw_metadata, indent=4, ensure_ascii=False))
+
+            for filename, img_bytes in results_bytes.items():
+                filepath = os.path.join(self.save_dir, f"{index}_{obj_id}_{filename}")
+                async with aiofiles.open(filepath, 'wb') as f:
+                    await f.write(img_bytes)
+
+            print(f"[LOG] Saving for image {index} finished")
+
+    @async_timer_decorator
+    async def run_pipeline(self, count: int) -> None:
+        """Инициализатор пайплайна."""
+        object_ids = self._get_urls_to_download(count)
+        if not object_ids:
+            print("[ERROR] Не удалось получить цели для скачивания.")
+            return
+
+        print(f"[INFO] Запланировано в пайплайн: {len(object_ids)} объектов.")
+
+        # Ограничиваем количество соединений и процессов
+        connector = aiohttp.TCPConnector(limit=10)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            with ProcessPoolExecutor() as executor:
+                # 1. Запуск генератора скачивания
+                download_stream = self.download_generator(object_ids, session)
+
+                # 2. Запуск генератора обработки
+                process_stream = self.process_generator(download_stream, executor)
+
+                # 3. Запуск потребителя (сохранение на диск)
+                await self.save_consumer(process_stream)
