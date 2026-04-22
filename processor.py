@@ -26,7 +26,7 @@ def process_artwork_task(index: int, artwork: ColorArtwork) -> tuple[int, int, d
     """
     pid = os.getpid()
     obj_id = artwork.metadata.object_id
-    print(f"[LOG] Convolution for image {index} (ID {obj_id}) started (PID {pid})")
+    print(f"[PROCESS] PID {pid} | Обработка {index} началась (ID {obj_id})")
 
     results_arrays = {}
     results_arrays['0_original.jpg'] = artwork.image
@@ -56,7 +56,7 @@ def process_artwork_task(index: int, artwork: ColorArtwork) -> tuple[int, int, d
         if success:
             results_bytes[filename] = encoded.tobytes()
 
-    print(f"[LOG] Convolution for image {index} (ID {obj_id}) finished (PID {pid})")
+    print(f"[PROCESS] PID {pid} | Обработка {index} завершена (ID {obj_id})")
     return index, obj_id, results_bytes, artwork.metadata.raw_data
 
 
@@ -77,6 +77,9 @@ class AsyncImageProcessor:
         self.save_dir = save_dir
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
+
+        self.main_pid = os.getpid()
+        print(f"[MAIN] PID главного процесса (asyncio): {self.main_pid}")
 
     def _get_urls_to_download(self, count: int) -> list[tuple[int, int]]:
         """Парсит CSV и фиксирует порядковые номера."""
@@ -100,7 +103,8 @@ class AsyncImageProcessor:
     async def _fetch_single(self, index: int, object_id: int, session: aiohttp.ClientSession, max_retries: int = 3) -> \
     tuple[int, ColorArtwork] | None:
         """Асинхронная загрузка одного изображения с повторными попытками при ошибках."""
-        print(f"[LOG] Downloading image {index} started (ID {object_id})")
+        pid = os.getpid()
+        print(f"[ASYNC] PID {pid} | Скачивание {index} началось (ID {object_id})")
         base_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{object_id}"
 
         for attempt in range(max_retries):
@@ -110,7 +114,7 @@ class AsyncImageProcessor:
 
                 img_url = data.get('primaryImageSmall')
                 if not img_url:
-                    print(f"[WARN] У объекта {object_id} нет фото. Пропускаем.")
+                    print(f"[ASYNC] PID {pid} | У объекта {object_id} нет фото. Пропускаем.")
                     return None
 
                 metadata = ArtworkMetadata(
@@ -127,23 +131,23 @@ class AsyncImageProcessor:
                 img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
                 if img_bgr is None:
-                    print(f"[WARN] Не удалось декодировать изображение {object_id}")
+                    print(f"[ASYNC] PID {pid} | Не удалось декодировать изображение {object_id}")
                     return None
 
-                print(f"[LOG] Downloading image {index} finished (ID {object_id})")
+                print(f"[ASYNC] PID {pid} | Скачивание {index} завершено (ID {object_id})")
                 return index, ColorArtwork(img_bgr, metadata)
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
                     print(
-                        f"[WARN] Ошибка загрузки {object_id} (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {wait_time} сек.")
+                        f"[ASYNC] PID {pid} | Ошибка загрузки {object_id} (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {wait_time} сек.")
                     await asyncio.sleep(wait_time)
                 else:
-                    print(f"[ERROR] Ошибка загрузки {object_id} после {max_retries} попыток: {e}")
+                    print(f"[ASYNC] PID {pid} | Ошибка загрузки {object_id} после {max_retries} попыток: {e}")
                     return None
             except Exception as e:
-                print(f"[ERROR] Неожиданная ошибка загрузки {object_id}: {e}")
+                print(f"[ASYNC] PID {pid} | Неожиданная ошибка загрузки {object_id}: {e}")
                 return None
 
         return None
@@ -166,6 +170,9 @@ class AsyncImageProcessor:
         self, object_ids: list[tuple[int, int]], session: aiohttp.ClientSession
     ) -> AsyncGenerator[tuple[int, ColorArtwork], None]:
         """Генератор №1: Асинхронно скачивает файлы и отдает их по мере готовности."""
+        pid = os.getpid()
+        print(f"[ASYNC] PID {pid} | Создано {len(object_ids)} задач на скачивание")
+
         pending = {asyncio.create_task(self._fetch_single(idx, obj_id, session)) for idx, obj_id in object_ids}
 
         while pending:
@@ -179,10 +186,12 @@ class AsyncImageProcessor:
             self, download_stream: AsyncGenerator[tuple[int, ColorArtwork], None], executor: ProcessPoolExecutor
     ) -> AsyncGenerator[tuple[int, int, dict[str, bytes], dict], None]:
         """Генератор №2: Принимает скачанные объекты и параллельно распределяет их по ядрам."""
+        pid = os.getpid()
         loop = asyncio.get_running_loop()
         pending_futures = set()
 
         async for index, artwork in download_stream:
+            print(f"[ASYNC] PID {pid} | Получено изображение {index}, отправка в процесс")
             future = loop.run_in_executor(executor, process_artwork_task, index, artwork)
             pending_futures.add(future)
 
@@ -197,8 +206,9 @@ class AsyncImageProcessor:
 
     async def save_consumer(self, process_stream: AsyncGenerator[tuple[int, int, dict[str, bytes], dict], None]) -> None:
         """Потребитель №3: Асинхронно сохраняет результаты на диск."""
+        pid = os.getpid()
         async for index, obj_id, results_bytes, raw_metadata in process_stream:
-            print(f"[LOG] Saving for image {index} started")
+            print(f"[ASYNC] PID {pid} | Сохранение {index} началось")
 
             meta_path = os.path.join(self.save_dir, f"{index}_{obj_id}_metadata.json")
             async with aiofiles.open(meta_path, 'w', encoding='utf-8') as f:
@@ -209,23 +219,26 @@ class AsyncImageProcessor:
                 async with aiofiles.open(filepath, 'wb') as f:
                     await f.write(img_bytes)
 
-            print(f"[LOG] Saving for image {index} finished")
+            print(f"[ASYNC] PID {pid} | Сохранение {index} завершено")
 
     @async_timer_decorator
     async def run_pipeline(self, count: int) -> None:
         """Инициализатор пайплайна."""
+        pid = os.getpid()
+        print(f"[ASYNC] PID {pid} | === Запуск пайплайна ===")
+
         object_ids = self._get_urls_to_download(count)
         if not object_ids:
             print("[ERROR] Не удалось получить цели для скачивания.")
             return
 
-        print(f"[INFO] Запланировано в пайплайн: {len(object_ids)} объектов.")
+        print(f"[ASYNC] PID {pid} | Запланировано объектов: {len(object_ids)}")
 
         connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             with ProcessPoolExecutor() as executor:
                 download_stream = self.download_generator(object_ids, session)
-
                 process_stream = self.process_generator(download_stream, executor)
-
                 await self.save_consumer(process_stream)
+
+        print(f"[ASYNC] PID {pid} | === Пайплайн завершен ===")
