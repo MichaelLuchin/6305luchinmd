@@ -50,7 +50,6 @@ def process_artwork_task(index: int, artwork: ColorArtwork) -> tuple[int, int, d
     blended = artwork + hist_obj
     results_arrays['6_blended_result.jpg'] = blended.image
 
-    # Кодируем изображения в байты внутри воркера для ускорения I/O в основном потоке
     results_bytes = {}
     for filename, img_array in results_arrays.items():
         success, encoded = cv2.imencode('.jpg', img_array)
@@ -96,7 +95,6 @@ class AsyncImageProcessor:
             return []
 
         targets = random.sample(paintings, min(count, len(paintings)))
-        # Формируем порядковый номер и ID объекта (начинается с 1)
         return [(i + 1, int(t['Object ID'])) for i, t in enumerate(targets)]
 
     async def _fetch_single(self, index: int, object_id: int, session: aiohttp.ClientSession, max_retries: int = 3) -> \
@@ -137,7 +135,7 @@ class AsyncImageProcessor:
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Экспоненциальная задержка: 1, 2, 4 секунды
+                    wait_time = 2 ** attempt
                     print(
                         f"[WARN] Ошибка загрузки {object_id} (попытка {attempt + 1}/{max_retries}): {e}. Повтор через {wait_time} сек.")
                     await asyncio.sleep(wait_time)
@@ -156,12 +154,9 @@ class AsyncImageProcessor:
             return set(), set()
 
         if block:
-            # Ждём завершения хотя бы одной задачи
             done, pending = await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
         else:
-            # Неблокирующая проверка: даём шанс завершившимся задачам
             done, pending = await asyncio.wait(futures, timeout=0)
-            # Если ничего не готово, даём управление циклу событий
             if not done:
                 await asyncio.sleep(0)
 
@@ -188,17 +183,13 @@ class AsyncImageProcessor:
         pending_futures = set()
 
         async for index, artwork in download_stream:
-            # ИСПРАВЛЕНИЕ: Мы не используем asyncio.create_task!
-            # run_in_executor уже возвращает объект Future, который мы можем ждать.
             future = loop.run_in_executor(executor, process_artwork_task, index, artwork)
             pending_futures.add(future)
 
-            # Отдаем готовые результаты, если они есть, не блокируя цикл
             done, pending_futures = await self._check_done(pending_futures, block=False)
             for f in done:
                 yield f.result()
 
-        # Дожидаемся завершения задач в пуле процессов
         while pending_futures:
             done, pending_futures = await self._check_done(pending_futures, block=True)
             for f in done:
@@ -230,15 +221,11 @@ class AsyncImageProcessor:
 
         print(f"[INFO] Запланировано в пайплайн: {len(object_ids)} объектов.")
 
-        # Ограничиваем количество соединений и процессов
         connector = aiohttp.TCPConnector(limit=10)
         async with aiohttp.ClientSession(connector=connector) as session:
             with ProcessPoolExecutor() as executor:
-                # 1. Запуск генератора скачивания
                 download_stream = self.download_generator(object_ids, session)
 
-                # 2. Запуск генератора обработки
                 process_stream = self.process_generator(download_stream, executor)
 
-                # 3. Запуск потребителя (сохранение на диск)
                 await self.save_consumer(process_stream)

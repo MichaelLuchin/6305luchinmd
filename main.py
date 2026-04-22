@@ -40,5 +40,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Защита точки входа важна для Windows, чтобы ProcessPoolExecutor не вошел в бесконечный цикл
     main()
