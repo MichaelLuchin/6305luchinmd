@@ -12,6 +12,7 @@ data/*.json
 processed_images/
 plots/
 logs/
+logging_config.json
 
 # Python (Кэш и артефакты сборки)
 __pycache__/
