@@ -1,5 +1,25 @@
-.idea
+# IDE (PyCharm)
+.idea/
+
+# Виртуальное окружение
 .project_venv/
+venv/
+.env
+
+# Данные и результаты (Тяжелые файлы и выходные папки)
+MetObjects.csv
+data/*.json
+processed_images/
+plots/
+logs/
+
+# Python (Кэш и артефакты сборки)
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Дополнительные инструменты
 .flake8
-/MetObjects.csv
-/paintings/
