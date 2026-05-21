@@ -7,7 +7,6 @@ import os
 
 CONFIG_FILE = "logging_config.json"
 
-# Настройки по умолчанию
 DEFAULT_CONFIG = {
     "version": 1,
     "disable_existing_loggers": False,

@@ -21,4 +21,4 @@ dependencies = [
 ]
 
 [project.scripts]
-metetl = "metetl.main:main"
+metetl = "metetl.__main__:main"
